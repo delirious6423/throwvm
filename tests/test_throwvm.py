@@ -1,11 +1,11 @@
-"""Offline tests for lib/throwvm.py (no VM is started). Run: python3 -I -m unittest discover -s tests -p 'test_*.py'"""
+"""Offline tests for throwvm.py (no VM is started). Run: python3 -I -m unittest discover -s tests -p 'test_*.py'"""
 import subprocess
 import sys
 import time
 import unittest
 from pathlib import Path
 
-LIB = Path(__file__).resolve().parent.parent / "lib"
+LIB = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(LIB))
 import throwvm  # noqa: E402
 

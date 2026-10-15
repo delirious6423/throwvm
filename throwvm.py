@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """Throwaway QEMU/KVM Ubuntu VMs reachable over SSH (stdlib only, no root needed).
 
-Shared by the VM tests of several projects. Python: `sys.path.insert(0, '~/code/dotfiles/lib'); import throwvm`.
-Bash: `eval "$(lib/throwvm.py up DIR --vm-dir ... --owner $$)"`, then `"${VM_SSH[@]}" cmd`, `lib/throwvm.py down DIR`.
+Needs Linux with KVM, QEMU, a systemd user session and Python 3.9+. https://github.com/delirious6423/throwvm (MIT)
+Python: `import throwvm; vm = throwvm.VM(workdir, vm_dir).boot(); vm.sh('uname -a'); vm.stop()`.
+Bash: `VM_ENV=$(throwvm.py up DIR --vm-dir ... --owner $$); eval "$VM_ENV"`, then `"${VM_SSH[@]}" cmd`,
+`throwvm.py down DIR`.
 
 - The Ubuntu cloud image is downloaded once (signature and checksum checked).
-- The first VM of a kind (name, hostname, RAM, CPUs, disk size) boots the cloud image and runs cloud-init; then its
-  disk and RAM are saved as a snapshot. Every later VM resumes that snapshot from a copy-on-write overlay and is
-  reachable over SSH within seconds. `fresh=True` skips the snapshot (cloud-init boot, ~25 s).
+- The first VM of a size (RAM, CPUs, disk) boots the cloud image and runs cloud-init; then its disk and RAM are
+  saved as the base snapshot. Every later VM resumes a snapshot from a copy-on-write overlay and is reachable over
+  SSH within seconds (its clock and hostname are set on resume). `fresh=True` skips snapshots (cloud-init, ~25 s).
+- `provision=SCRIPT` (CLI: `--provision`): a bash script run once as root with network on top of the base; the
+  result is a second snapshot layer, rebuilt automatically when the script changes.
 - Each VM runs in its own `systemd-run --user --scope` unit with MemoryHigh/MemoryMax, so stopping it stops the
   whole group and its memory and CPU use is read from the cgroup.
 - A VM only starts when free RAM allows (MemAvailable minus what running VMs may still grow into, minus a reserve);
   otherwise it waits. Starts are serialized by a lock file.
 - The VM is stopped when its owner process exits (a guard process watches it), so no VM outlives a killed run.
 - On failure `stop(failed=True)` keeps console.log, qemu.log and the guest journal; only the disk is deleted.
-- `WindowsVM` (CLI: `up-windows`): the same for a Windows golden image built by vm/windows/build.sh, with UEFI
+- `WindowsVM` (CLI: `up-windows`): the same for a Windows golden image you build (see WindowsVM), with UEFI
   Secure Boot and a swtpm TPM in the scope. Its snapshot keeps the RAM as a file that VMs map copy-on-write, so a
   6 GiB Windows resumes in ~3 s instead of booting in ~15 s.
 """
@@ -553,9 +557,11 @@ class VM:
 
 
 class WindowsVM(VM):
-    """Throwaway copy of a Windows golden image (vm/windows/build.sh); SSH lands in PowerShell as tester.
+    """Throwaway copy of a Windows golden image; SSH lands in PowerShell as tester.
 
-    The machine is build.sh's: UEFI Secure Boot (OVMF code + a copy of the image's NVRAM vars), a swtpm TPM 2.0 that
+    The golden image is a directory with disk.qcow2 (Windows with OpenSSH Server accepting `key` for an
+    administrator `tester`, auto-logon to the desktop), vars.fd (its OVMF NVRAM vars) and tpm/ (its swtpm state).
+    The machine must match the one it was installed on: UEFI Secure Boot (OVMF code + a copy of the image's NVRAM vars), a swtpm TPM 2.0 that
     runs inside the VM's scope, AHCI disk, e1000e NIC. The snapshot of a golden image is its first boot, saved once
     the desktop is up and the guest has gone quiet. The firmware vars (pflash) and the TPM state (QEMU's
     tpm-emulator backend) are saved with the RAM, so on resume they match the running Windows exactly.
@@ -580,7 +586,7 @@ class WindowsVM(VM):
     def _check(self):
         for f in ('disk.qcow2', 'vars.fd', 'tpm'):
             if not os.path.exists(os.path.join(self.golden, f)):
-                raise RuntimeError(f'no {f} in the golden image {self.golden} (run vm/windows/build.sh)')
+                raise RuntimeError(f'no {f} in the golden image {self.golden} (see WindowsVM)')
         if not shutil.which('swtpm') or not os.path.exists(self.OVMF_CODE):
             raise RuntimeError('needs swtpm and ovmf (apt install swtpm ovmf)')
 
@@ -810,18 +816,18 @@ def main(argv=None):
                          'second snapshot layer, rebuilt when the script changes')
     up.add_argument('--fresh', action='store_true', help='boot through cloud-init instead of the snapshot')
     up.add_argument('--timeout', type=int, default=300)
-    win = sub.add_parser('up-windows', help='start a throwaway copy of a Windows golden image (vm/windows) in DIR')
+    win = sub.add_parser('up-windows', help='start a throwaway copy of a Windows golden image in DIR')
     win.add_argument('dir')
     win.add_argument('--vm-dir', default=os.environ.get('VM_DIR'), required='VM_DIR' not in os.environ,
                      help='where the snapshots go (default: $VM_DIR)')
-    win.add_argument('--golden', required=True, help='directory with disk.qcow2, vars.fd and tpm/ (build.sh)')
+    win.add_argument('--golden', required=True, help='directory with disk.qcow2, vars.fd and tpm/')
     win.add_argument('--key', required=True, help='SSH private key that the image accepts')
     win.add_argument('--name', default='windows')
     win.add_argument('--mem', type=int, default=6144, help='MiB')
     win.add_argument('--cpus', type=int, default=4)
     win.add_argument('--ssh-port', type=int, help='fixed host port for SSH (default: a free one)')
     win.add_argument('--vnc', type=int, help='VNC display on 127.0.0.1')
-    win.add_argument('--acpi-table', action='append', default=[], help='extra ACPI table file (e.g. MSDM)')
+    win.add_argument('--acpi-table', action='append', default=[], help='extra ACPI table file, e.g. the host\'s MSDM (OEM licence key)')
     win.add_argument('--owner', type=int, required=True, help='as for up')
     win.add_argument('--fresh', action='store_true', help='cold-boot the golden image instead of the snapshot')
     win.add_argument('--timeout', type=int, default=600)
