@@ -102,10 +102,12 @@ if [ -z "${THROWVM:-}" ]; then                         # THROWVM=/path/to/throwv
     THROWVM="${XDG_CACHE_HOME:-$HOME/.cache}/throwvm/$THROWVM_VERSION/throwvm.py"
     if ! { [ -f "$THROWVM" ] && echo "$THROWVM_SHA256  $THROWVM" | sha256sum -c --status; }; then
         mkdir -p "$(dirname "$THROWVM")"
-        curl -fsSL --retry 3 --max-time 60 -o "$THROWVM.new" \
+        new=$(mktemp "$THROWVM.XXXXXX")                 # parallel runs each download their own copy
+        curl -fsSL --retry 3 --max-time 60 -o "$new" \
             "https://raw.githubusercontent.com/delirious6423/throwvm/$THROWVM_VERSION/throwvm.py"
-        echo "$THROWVM_SHA256  $THROWVM.new" | sha256sum -c --status || { echo "throwvm.py: checksum mismatch" >&2; exit 1; }
-        mv "$THROWVM.new" "$THROWVM"
+        echo "$THROWVM_SHA256  $new" | sha256sum -c --status \
+            || { echo "throwvm.py $THROWVM_VERSION: checksum mismatch" >&2; rm -f "$new"; exit 1; }
+        mv "$new" "$THROWVM"
     fi
 fi
 python3 -I "$THROWVM" up ...
