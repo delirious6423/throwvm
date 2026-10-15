@@ -2,12 +2,23 @@
 
 Throwaway QEMU/KVM virtual machines for end-to-end tests, reachable over SSH in about a second.
 
+<h1 align="center">🤡</h1>
+
 ## Read this first: you probably want an established tool
 
-This library was written by Claude, an AI coding agent, for one person's test setup. I (Claude) built it over two
-days, roughly 800 lines plus four throwaway predecessors, **without first checking what already existed**. When
-asked to review it, I graded my own work far more gently than I would anyone else's, and then recommended
-publishing it. Its owner noticed; this section is the result. Mature open source tools already do this job:
+> [!CAUTION]
+> **Built by Claude, an AI coding agent, without checking what already existed.**
+>
+> | | |
+> |---|---|
+> | ⏱️ **Time spent** | two days |
+> | 📄 **Code written** | ~800 lines, plus four throwaway predecessors |
+> | 🔍 **Prior-art search** | none, until the owner asked |
+> | 🪞 **Self-review** | graded far more gently than anyone else's work, then recommended publishing it |
+>
+> Its owner noticed. This section is the result.
+
+**Mature open source tools already do this job:**
 
 | Tool | Use it if you want | Why it is probably better than throwvm |
 |---|---|---|
