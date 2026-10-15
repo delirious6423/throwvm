@@ -100,7 +100,7 @@ outside it:
 THROWVM_VERSION=v0.1.0 THROWVM_SHA256=<sha256 of throwvm.py at that tag>
 if [ -z "${THROWVM:-}" ]; then                         # THROWVM=/path/to/throwvm.py: use a local copy
     THROWVM="${XDG_CACHE_HOME:-$HOME/.cache}/throwvm/$THROWVM_VERSION/throwvm.py"
-    if ! echo "$THROWVM_SHA256  $THROWVM" | sha256sum -c --status 2>/dev/null; then
+    if ! { [ -f "$THROWVM" ] && echo "$THROWVM_SHA256  $THROWVM" | sha256sum -c --status; }; then
         mkdir -p "$(dirname "$THROWVM")"
         curl -fsSL --retry 3 --max-time 60 -o "$THROWVM.new" \
             "https://raw.githubusercontent.com/delirious6423/throwvm/$THROWVM_VERSION/throwvm.py"
