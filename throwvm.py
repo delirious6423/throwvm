@@ -166,19 +166,23 @@ class VM:
         self.dir, self.vm_dir, self.name = os.path.abspath(workdir), vm_dir, name
         self.mem_mb, self.cpus, self.disk_gb, self.hostname, self.fresh = mem_mb, cpus, disk_gb, hostname, fresh
         self.owner = os.getpid() if owner is None else owner      # 0: nobody, the VM runs until stopped
-        self.ssh_port = self.unit = self.key = self.proc = None
+        self.ssh_port = self.unit = self.key = self.proc = self.image = None
+        self.fixed_port = None                                    # set: always forward this host port to SSH
         self.made_snapshot = False
 
     # -- state shared with the CLI
-    def _save(self):
-        keys = ('vm_dir', 'name', 'mem_mb', 'cpus', 'disk_gb', 'hostname', 'ssh_port', 'unit', 'key')
-        with open(os.path.join(self.dir, 'vm.json'), 'w') as f:
-            json.dump({k: getattr(self, k) for k in keys}, f)
+    KIND = 'ubuntu'
+    SAVED = ('vm_dir', 'name', 'mem_mb', 'cpus', 'disk_gb', 'hostname', 'ssh_port', 'unit', 'key')
 
-    @classmethod
-    def load(cls, workdir):
+    def _save(self):
+        with open(os.path.join(self.dir, 'vm.json'), 'w') as f:
+            json.dump({'kind': self.KIND, **{k: getattr(self, k) for k in self.SAVED}}, f)
+
+    @staticmethod
+    def load(workdir):
+        """The VM started in workdir (by this or another process), owned by nobody."""
         d = json.load(open(os.path.join(workdir, 'vm.json')))
-        vm = cls(workdir, d['vm_dir'], d['name'], d['mem_mb'], d['cpus'], d['disk_gb'], d['hostname'], owner=0)
+        vm = VM(workdir, d['vm_dir'], d['name'], d['mem_mb'], d['cpus'], d['disk_gb'], d['hostname'], owner=0)
         vm.ssh_port, vm.unit, vm.key = d['ssh_port'], d['unit'], d['key']
         return vm
 
@@ -191,30 +195,18 @@ class VM:
     def boot(self, timeout=300):
         """Start the VM (from the snapshot unless fresh) and wait until SSH works. Returns self."""
         os.makedirs(self.dir, exist_ok=True)
-        image = ensure_image(os.path.join(self.vm_dir, 'images'))
+        self._check()
         t0 = time.time()
         try:
             if self.fresh:
-                self.key = os.path.join(self.dir, 'id_vm')
-                _keygen(self.key)
-                self._cold_boot(image, os.path.join(self.dir, 'disk.qcow2'), self.dir, timeout)
+                self._fresh_boot(timeout)
             else:
-                snap = self._snapshot(image, timeout)
-                self.key = os.path.join(snap, 'id_vm')
-                _run(['qemu-img', 'create', '-q', '-f', 'qcow2', '-F', 'qcow2', '-b', os.path.join(snap, 'disk.qcow2'),
-                      os.path.join(self.dir, 'disk.qcow2')])
-                self._start(os.path.join(self.dir, 'disk.qcow2'), self.dir, incoming=os.path.join(snap, 'state'))
-                qmp = QMP(_qmp_path(self.dir))
-                end = time.time() + timeout
-                while (st := qmp.cmd('query-migrate').get('status')) != 'completed':   # loading the RAM state
-                    if st in ('failed', 'cancelled') or time.time() > end:
-                        raise RuntimeError(f'resuming the snapshot: {st}')
-                    time.sleep(0.05)
-                qmp.cmd('cont')               # saved while stopped, so it resumes paused
-                qmp.close()
-                self._wait_ssh(timeout)
-                # The guest clock resumes where the snapshot was taken.
-                self.sh(f'date -u -s @{time.time():.3f} >/dev/null', root=True, timeout=30)
+                snap = self._snapshot(timeout)
+                ram = os.path.join(snap, 'ram')
+                self._start(self._overlay(snap), self.dir, incoming=True,
+                            ram=(ram, False) if os.path.exists(ram) else None)
+                self._resume(self.dir, snap, timeout)
+                self._ready(timeout)
         except BaseException:
             self.stop(failed=True)
             raise
@@ -222,6 +214,27 @@ class VM:
         how = 'fresh' if self.fresh else 'snapshot made, then resumed' if self.made_snapshot else 'from snapshot'
         log(f'VM up in {time.time() - t0:.1f} s ({how}), unit {self.unit}')
         return self
+
+    def _check(self):
+        """Inputs present before anything starts: here the verified cloud image."""
+        self.image = ensure_image(os.path.join(self.vm_dir, 'images'))
+
+    def _fresh_boot(self, timeout):
+        self.key = os.path.join(self.dir, 'id_vm')
+        _keygen(self.key)
+        self._cold_boot(self.image, os.path.join(self.dir, 'disk.qcow2'), self.dir, timeout)
+
+    def _overlay(self, snap):
+        """Set up this VM's files on top of the snapshot; returns the disk to start."""
+        self.key = os.path.join(snap, 'id_vm')
+        disk = os.path.join(self.dir, 'disk.qcow2')
+        _run(['qemu-img', 'create', '-q', '-f', 'qcow2', '-F', 'qcow2', '-b', os.path.join(snap, 'disk.qcow2'), disk])
+        return disk
+
+    def _ready(self, timeout):
+        """After a resume: wait for SSH and set the guest clock, which resumes where the snapshot was taken."""
+        self._wait_ssh(timeout)
+        self.sh(f'date -u -s @{time.time():.3f} >/dev/null', root=True, timeout=30)
 
     def _seed(self, d):
         seed = os.path.join(d, 'seed')
@@ -252,10 +265,14 @@ class VM:
             httpd.shutdown()
             httpd.server_close()
 
-    def _snapshot(self, image, timeout):
-        """Directory with disk.qcow2 + state (RAM) + id_vm of a VM just after cloud-init; made once per kind."""
-        sums = _sum_line(os.path.dirname(image)).split()[0]
-        kind = json.dumps([LAYOUT, sums, self.hostname, self.mem_mb, self.cpus, self.disk_gb])
+    def _kind(self):
+        """What a snapshot depends on: VMs of the same kind share one."""
+        sums = _sum_line(os.path.dirname(self.image)).split()[0]
+        return [LAYOUT, sums, self.hostname, self.mem_mb, self.cpus, self.disk_gb]
+
+    def _snapshot(self, timeout):
+        """Directory with the saved VM (disk, RAM state, ...) just after it booted; made once per kind."""
+        kind = json.dumps(self._kind())
         snaps = os.path.join(self.vm_dir, 'snapshots')
         snap = os.path.join(snaps, f'{self.name}-{hashlib.sha256(kind.encode()).hexdigest()[:12]}')
         os.makedirs(snaps, exist_ok=True)
@@ -264,39 +281,16 @@ class VM:
             if os.path.exists(os.path.join(snap, 'state')):
                 os.utime(snap)                        # last use, for prune
                 return snap
-            log(f'preparing snapshot {os.path.basename(snap)} (once: cloud-init boot, then save disk and RAM)')
+            log(f'preparing snapshot {os.path.basename(snap)} (once: {self.SNAPSHOT_HOW}, then save disk and RAM)')
             self.made_snapshot = True
             tmp = f'{snap}.tmp-{os.getpid()}'
             shutil.rmtree(tmp, ignore_errors=True)
             os.makedirs(tmp)
-            self.key = os.path.join(tmp, 'id_vm')
-            _keygen(self.key)
             try:
-                self._cold_boot(image, os.path.join(tmp, 'disk.qcow2'), tmp, timeout)
-                # cloud-init never runs again; the journal also goes to the serial console, so console.log shows
-                # what happened even when SSH drops.
-                rc, out = self.sh(
-                    'touch /etc/cloud/cloud-init.disabled && mkdir -p /etc/systemd/journald.conf.d && printf '
-                    '"[Journal]\\nForwardToConsole=yes\\nTTYPath=/dev/ttyS0\\nMaxLevelConsole=info\\n" '
-                    '> /etc/systemd/journald.conf.d/throwvm-console.conf && systemctl restart systemd-journald && '
-                    'sync && echo 3 > /proc/sys/vm/drop_caches', root=True, timeout=60)
-                if rc != 0:
-                    raise RuntimeError(f'preparing the snapshot failed: {out}')
-                qmp = QMP(_qmp_path(tmp))
-                qmp.cmd('stop')
-                qmp.cmd('migrate-set-parameters', **{'max-bandwidth': 2**40})
-                qmp.cmd('migrate', uri=f'file:{tmp}/state')
-                end = time.time() + 300
-                while (st := qmp.cmd('query-migrate').get('status')) != 'completed':
-                    if st in ('failed', 'cancelled') or time.time() > end:
-                        raise RuntimeError(f'saving the VM state: {st}')
-                    time.sleep(0.2)
-                qmp.close()
+                self._prepare_snapshot(tmp, timeout)
+                self._save_state(tmp, os.path.join(tmp, 'state'))
                 self._stop_unit()
-                for f in ('disk.qcow2', 'state'):
-                    os.chmod(os.path.join(tmp, f), 0o444)   # backing files of every later VM: never written again
-                os.remove(os.path.join(tmp, 'qemu.log'))
-                shutil.rmtree(os.path.join(tmp, 'seed'))
+                self._seal_snapshot(tmp)
                 os.rename(tmp, snap)
             except BaseException:
                 self._stop_unit()
@@ -305,20 +299,80 @@ class VM:
             log(f'snapshot ready: {os.path.getsize(os.path.join(snap, "state")) // 2**20} MiB RAM state')
             return snap
 
-    def _start(self, disk, d, seed_port=None, incoming=None):
-        """Start QEMU in its own scope (waiting for free RAM first). Retries if the random SSH port was taken."""
-        for attempt in range(3):
-            self.ssh_port = free_port()
-            qemu = ['qemu-system-x86_64', '-enable-kvm', '-cpu', 'host', '-machine', 'q35', '-smp', str(self.cpus),
-                    '-m', str(self.mem_mb), '-display', 'none', '-serial', f'file:{d}/console.log',
-                    '-monitor', 'none', '-qmp', f'unix:{_qmp_path(d)},server=on,wait=off',
-                    '-device', 'virtio-rng-pci', '-device', 'vmgenid',   # fresh entropy after a snapshot resume
-                    '-drive', f'file={disk},if=virtio',
-                    '-nic', f'user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:{self.ssh_port}-:22']
-            if seed_port:
-                qemu += ['-smbios', f'type=1,serial=ds=nocloud;s=http://10.0.2.2:{seed_port}/']
+    SNAPSHOT_HOW = 'cloud-init boot'
+
+    def _prepare_snapshot(self, tmp, timeout):
+        """Boot the VM that will be saved, in tmp, and leave it running."""
+        self.key = os.path.join(tmp, 'id_vm')
+        _keygen(self.key)
+        self._cold_boot(self.image, os.path.join(tmp, 'disk.qcow2'), tmp, timeout)
+        # cloud-init never runs again; the journal also goes to the serial console, so console.log shows
+        # what happened even when SSH drops.
+        rc, out = self.sh(
+            'touch /etc/cloud/cloud-init.disabled && mkdir -p /etc/systemd/journald.conf.d && printf '
+            '"[Journal]\\nForwardToConsole=yes\\nTTYPath=/dev/ttyS0\\nMaxLevelConsole=info\\n" '
+            '> /etc/systemd/journald.conf.d/throwvm-console.conf && systemctl restart systemd-journald && '
+            'sync && echo 3 > /proc/sys/vm/drop_caches', root=True, timeout=60)
+        if rc != 0:
+            raise RuntimeError(f'preparing the snapshot failed: {out}')
+
+    def _seal_snapshot(self, tmp):
+        for f in ('disk.qcow2', 'state'):
+            os.chmod(os.path.join(tmp, f), 0o444)   # backing files of every later VM: never written again
+        os.remove(os.path.join(tmp, 'qemu.log'))
+        shutil.rmtree(os.path.join(tmp, 'seed'))
+
+    def _save_state(self, d, path):
+        """Stop the VM running in d and save its RAM and device state to path (the disk is saved as it is).
+        If the guest RAM is the file d/ram (see _start), it stays there and path only gets the device state."""
+        ram = os.path.join(d, 'ram')
+        qmp = QMP(_qmp_path(d))
+        qmp.cmd('stop')
+        if os.path.exists(ram):
+            qmp.cmd('migrate-set-capabilities', capabilities=[{'capability': 'x-ignore-shared', 'state': True}])
+        qmp.cmd('migrate-set-parameters', **{'max-bandwidth': 2**40})
+        qmp.cmd('migrate', uri=f'file:{path}')
+        end = time.time() + 300
+        while (st := qmp.cmd('query-migrate').get('status')) != 'completed':
+            if st in ('failed', 'cancelled') or time.time() > end:
+                raise RuntimeError(f'saving the VM state: {st}')
+            time.sleep(0.2)
+        qmp.close()
+        if os.path.exists(ram):
+            fd = os.open(ram, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+    def _resume(self, d, snap, timeout):
+        """Load the snapshot's saved state into the VM in d (started with incoming=True), then run it."""
+        qmp = QMP(_qmp_path(d))
+        if os.path.exists(os.path.join(snap, 'ram')):    # RAM is mapped from the file, only device state is loaded
+            qmp.cmd('migrate-set-capabilities', capabilities=[{'capability': 'x-ignore-shared', 'state': True}])
+        qmp.cmd('migrate-incoming', uri=f'file:{os.path.join(snap, "state")}')
+        end = time.time() + timeout
+        while (st := qmp.cmd('query-migrate').get('status')) != 'completed':   # loading the RAM state
+            if st in ('failed', 'cancelled') or time.time() > end:
+                raise RuntimeError(f'resuming the snapshot: {st}')
+            time.sleep(0.05)
+        qmp.cmd('cont')               # saved while stopped, so it resumes paused
+        qmp.close()
+
+    def _start(self, disk, d, seed_port=None, incoming=False, ram=None):
+        """Start QEMU in its own scope (waiting for free RAM first). Retries if the random SSH port was taken.
+        incoming: wait for _resume to load a saved state. ram: (file, shared) to back the guest RAM by a file:
+        shared while preparing a snapshot (the file is then the saved RAM), private on resume (copy-on-write: pages
+        are read from the file as the guest touches them, and VMs of a kind share the page cache)."""
+        for attempt in range(1 if self.fixed_port else 3):
+            self.ssh_port = self.fixed_port or free_port()
+            qemu = self._qemu_argv(disk, d, seed_port)
+            if ram:
+                opts = 'share=on' if ram[1] else 'share=off,readonly=on,rom=off'
+                qemu += ['-object', f'memory-backend-file,id=ram0,size={self.mem_mb}M,mem-path={ram[0]},{opts}',
+                         '-machine', 'memory-backend=ram0']
             if incoming:
-                qemu += ['-incoming', f'file:{incoming}']
+                qemu += ['-incoming', 'defer']
             self.unit = f'throwvm-{self.name}-{os.getpid()}-{attempt}-{time.time_ns() % 10**6}.scope'
             mem = self.mem_mb + OVERHEAD_MB
             with admitted(self.vm_dir, mem):
@@ -326,7 +380,8 @@ class VM:
                     ['systemd-run', '--user', '--scope', '--quiet', f'--unit={self.unit}',
                      '-p', f'MemoryMax={mem}M', '-p', f'MemoryHigh={self.mem_mb + HIGH_MB}M',
                      '-p', 'CollectMode=inactive-or-failed',
-                     sys.executable, '-I', os.path.abspath(__file__), '_guard', str(self.owner), '--', *qemu],
+                     sys.executable, '-I', os.path.abspath(__file__), '_guard', str(self.owner), '--',
+                     *self._scope_argv(qemu, d)],
                     stdin=subprocess.DEVNULL, stdout=open(f'{d}/qemu.log', 'w'), stderr=subprocess.STDOUT,
                     start_new_session=True)
                 end = time.time() + 10
@@ -342,9 +397,24 @@ class VM:
                 raise RuntimeError(f'QEMU exited at start: {err.strip()}')
         raise RuntimeError('no free SSH port after 3 tries')
 
+    def _qemu_argv(self, disk, d, seed_port=None):
+        qemu = ['qemu-system-x86_64', '-enable-kvm', '-cpu', 'host', '-machine', 'q35', '-smp', str(self.cpus),
+                '-m', str(self.mem_mb), '-display', 'none', '-serial', f'file:{d}/console.log',
+                '-monitor', 'none', '-qmp', f'unix:{_qmp_path(d)},server=on,wait=off',
+                '-device', 'virtio-rng-pci', '-device', 'vmgenid',   # fresh entropy after a snapshot resume
+                '-drive', f'file={disk},if=virtio',
+                '-nic', f'user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:{self.ssh_port}-:22']
+        if seed_port:
+            qemu += ['-smbios', f'type=1,serial=ds=nocloud;s=http://10.0.2.2:{seed_port}/']
+        return qemu
+
+    def _scope_argv(self, qemu, d):
+        """What runs in the VM's scope (under the guard): QEMU, or a wrapper that starts helpers and execs it."""
+        return qemu
+
     def _wait_ssh(self, timeout):
         end = time.time() + timeout
-        while self.sh('true', timeout=10)[0] != 0:
+        while self.sh('exit 0', timeout=10)[0] != 0:            # also a no-op in PowerShell
             if time.time() > end or self.proc.poll() is not None:
                 raise RuntimeError(f'VM did not come up (see {self.dir}/console.log and qemu.log)')
             time.sleep(0.5)
