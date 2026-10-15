@@ -199,7 +199,7 @@ class VM:
 
     BASE_HOSTNAME = 'throwvm'   # in the shared base snapshot; each VM sets its own hostname on resume
 
-    def __init__(self, workdir, vm_dir, name='vm', mem_mb=3072, cpus=2, disk_gb=20, hostname='testbox',
+    def __init__(self, workdir, vm_dir, name='vm', mem_mb=3072, cpus=2, disk_gb=40, hostname='testbox',
                  owner=None, fresh=False, provision=None, provision_timeout=1800, max_age_days=7):
         """provision: a script run once as root (bash, with network) on top of the base snapshot; the result is saved as
         a second snapshot layer, rebuilt when the script changes or is older than max_age_days (0: never), so the
@@ -864,7 +864,7 @@ def main(argv=None):
     up.add_argument('--name', default='vm', help='kind of VM: names the snapshot and the scope unit')
     up.add_argument('--mem', type=int, default=3072, help='MiB')
     up.add_argument('--cpus', type=int, default=2)
-    up.add_argument('--disk-gb', type=int, default=20)
+    up.add_argument('--disk-gb', type=int, default=40, help='virtual size; the disk only grows as written')
     up.add_argument('--hostname', default='testbox')
     up.add_argument('--owner', type=int, required=True,
                     help='stop the VM when this PID exits (bash: $$, not the $(...) subshell); 0 = keep running')
