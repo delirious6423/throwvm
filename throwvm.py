@@ -25,7 +25,7 @@ RELEASE, VERSION = 'resolute', '26.04'
 IMG = f'ubuntu-{VERSION}-server-cloudimg-amd64.img'
 URL = f'https://cloud-images.ubuntu.com/releases/{RELEASE}/release'
 KEYRING = '/usr/share/keyrings/ubuntu-cloudimage-keyring.gpg'
-LAYOUT = 1               # bump when the QEMU command line or the snapshot preparation changes: old snapshots go stale
+LAYOUT = 2               # bump when the QEMU command line or the snapshot preparation changes: old snapshots go stale
 WINDOWS_LAYOUT = 1       # the same for WindowsVM snapshots
 OVERHEAD_MB = 1024       # MemoryMax = guest RAM + this (QEMU itself, page cache of the disk files)
 HIGH_MB = 512            # MemoryHigh = guest RAM + this: above it the kernel reclaims the scope's page cache first
@@ -177,9 +177,15 @@ class QMP:
 class VM:
     """One throwaway VM. Files live in workdir: disk overlay, logs, vm.json (so the CLI can find it again)."""
 
+    BASE_HOSTNAME = 'throwvm'   # in the shared base snapshot; each VM sets its own hostname on resume
+
     def __init__(self, workdir, vm_dir, name='vm', mem_mb=3072, cpus=2, disk_gb=20, hostname='testbox',
-                 owner=None, fresh=False):
+                 owner=None, fresh=False, provision=None, provision_timeout=1800):
+        """provision: a script run once as root (bash, with network) on top of the base snapshot; the result is saved as
+        a second snapshot layer, rebuilt when the script changes."""
         self.dir, self.vm_dir, self.name = os.path.abspath(workdir), vm_dir, name
+        self.provision = os.path.abspath(provision) if provision else None
+        self.provision_timeout = provision_timeout
         self.mem_mb, self.cpus, self.disk_gb, self.hostname, self.fresh = mem_mb, cpus, disk_gb, hostname, fresh
         self.owner = os.getpid() if owner is None else owner      # 0: nobody, the VM runs until stopped
         self.ssh_port = self.unit = self.key = self.proc = self.image = None
@@ -241,7 +247,9 @@ class VM:
     def _fresh_boot(self, timeout):
         self.key = os.path.join(self.dir, 'id_vm')
         _keygen(self.key)
-        self._cold_boot(self.image, os.path.join(self.dir, 'disk.qcow2'), self.dir, timeout)
+        self._cold_boot(self.image, os.path.join(self.dir, 'disk.qcow2'), self.dir, timeout, self.hostname)
+        if self.provision:
+            self._run_provision(timeout)
 
     def _overlay(self, snap):
         """Set up this VM's files on top of the snapshot; returns the disk to start."""
@@ -251,27 +259,33 @@ class VM:
         return disk
 
     def _ready(self, timeout):
-        """After a resume: wait for SSH and set the guest clock, which resumes where the snapshot was taken."""
+        """After a resume: wait for SSH, set the guest clock (it resumes where the snapshot was taken) and the
+        hostname (the base snapshot is shared by VMs of every name)."""
         self._wait_ssh(timeout)
-        self.sh(f'date -u -s @{time.time():.3f} >/dev/null', root=True, timeout=30)
+        h = shlex.quote(self.hostname)
+        rc, out = self.sh(f'date -u -s @{time.time():.3f} >/dev/null && hostnamectl set-hostname {h} && '
+                          f'sed -i "s/^127\\.0\\.1\\.1\\s.*/127.0.1.1 {self.hostname}/" /etc/hosts',
+                          root=True, timeout=30)
+        if rc != 0:
+            raise RuntimeError(f'setting clock and hostname after resume: {out}')
 
-    def _seed(self, d):
+    def _seed(self, d, hostname):
         seed = os.path.join(d, 'seed')
         os.makedirs(seed, exist_ok=True)
         pub = open(self.key + '.pub').read().strip()
         open(os.path.join(seed, 'user-data'), 'w').write(
-            f'#cloud-config\nhostname: {self.hostname}\npackage_update: false\nusers:\n  - name: tester\n'
+            f'#cloud-config\nhostname: {hostname}\npackage_update: false\nusers:\n  - name: tester\n'
             '    shell: /bin/bash\n    sudo: ALL=(ALL) NOPASSWD:ALL\n'
             f'    ssh_authorized_keys: ["{pub}"]\nssh_pwauth: false\n')
         open(os.path.join(seed, 'meta-data'), 'w').write(f'instance-id: {self.name}-{time.time_ns()}\n'
-                                                          f'local-hostname: {self.hostname}\n')
+                                                          f'local-hostname: {hostname}\n')
         open(os.path.join(seed, 'vendor-data'), 'w').close()
         return seed
 
-    def _cold_boot(self, image, disk, d, timeout):
+    def _cold_boot(self, image, disk, d, timeout, hostname):
         """Boot the cloud image through cloud-init (seeded over HTTP from this process)."""
         _run(['qemu-img', 'create', '-q', '-f', 'qcow2', '-F', 'qcow2', '-b', image, disk, f'{self.disk_gb}G'])
-        handler = functools.partial(_QuietHandler, directory=self._seed(d))
+        handler = functools.partial(_QuietHandler, directory=self._seed(d, hostname))
         httpd = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         try:
@@ -287,29 +301,41 @@ class VM:
     def _kind(self):
         """What a snapshot depends on: VMs of the same kind share one."""
         sums = _sum_line(os.path.dirname(self.image)).split()[0]
-        return [LAYOUT, sums, self.hostname, self.mem_mb, self.cpus, self.disk_gb]
+        return [LAYOUT, sums, self.mem_mb, self.cpus, self.disk_gb]
 
     def _snapshot(self, timeout):
-        """Directory with the saved VM (disk, RAM state, ...) just after it booted; made once per kind."""
-        kind = json.dumps(self._kind())
+        """Directory of the saved VM to resume: the base snapshot (just after boot, shared by every VM of a kind),
+        or with provision the layer on top of it."""
+        base = self._layer(self.KIND, self._kind(), self.SNAPSHOT_HOW, self._prepare_snapshot, self._seal_snapshot,
+                           timeout)
+        if not self.provision:
+            return base
+        script = hashlib.sha256(open(self.provision, 'rb').read()).hexdigest()
+        return self._layer(self.name, [os.path.basename(base), script],
+                           f'resume {os.path.basename(base)}, run {os.path.basename(self.provision)}',
+                           functools.partial(self._prepare_provisioned, base), self._seal_provisioned, timeout)
+
+    def _layer(self, prefix, kind, how, prepare, seal, timeout):
+        """vm_dir/snapshots/<prefix>-<hash of kind>: made once (prepare boots a VM in a temporary directory, which is
+        then saved and sealed); later calls only mark it used, for prune."""
         snaps = os.path.join(self.vm_dir, 'snapshots')
-        snap = os.path.join(snaps, f'{self.name}-{hashlib.sha256(kind.encode()).hexdigest()[:12]}')
+        snap = os.path.join(snaps, f'{prefix}-{hashlib.sha256(json.dumps(kind).encode()).hexdigest()[:12]}')
         os.makedirs(snaps, exist_ok=True)
         with open(snap + '.lock', 'w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)          # a second run of the same kind waits for the first to finish
             if os.path.exists(os.path.join(snap, 'state')):
-                os.utime(snap)                        # last use, for prune
+                os.utime(snap)
                 return snap
-            log(f'preparing snapshot {os.path.basename(snap)} (once: {self.SNAPSHOT_HOW}, then save disk and RAM)')
+            log(f'preparing snapshot {os.path.basename(snap)} (once: {how}, then save disk and RAM)')
             self.made_snapshot = True
             tmp = f'{snap}.tmp-{os.getpid()}'
             shutil.rmtree(tmp, ignore_errors=True)
             os.makedirs(tmp)
             try:
-                self._prepare_snapshot(tmp, timeout)
+                prepare(tmp, timeout)
                 self._save_state(tmp, os.path.join(tmp, 'state'))
                 self._stop_unit()
-                self._seal_snapshot(tmp)
+                seal(tmp)
                 os.rename(tmp, snap)
             except BaseException:
                 self._stop_unit()
@@ -318,13 +344,45 @@ class VM:
             log(f'snapshot ready: {os.path.getsize(os.path.join(snap, "state")) // 2**20} MiB RAM state')
             return snap
 
+    def _prepare_provisioned(self, base, tmp, timeout):
+        """Resume the base snapshot in tmp and run the provision script in it."""
+        for f in ('id_vm', 'id_vm.pub'):
+            shutil.copy2(os.path.join(base, f), os.path.join(tmp, f))
+        self.key = os.path.join(tmp, 'id_vm')
+        disk = os.path.join(tmp, 'disk.qcow2')
+        _run(['qemu-img', 'create', '-q', '-f', 'qcow2', '-F', 'qcow2', '-b', os.path.join(base, 'disk.qcow2'), disk])
+        self._start(disk, tmp, incoming=True)
+        self._resume(tmp, base, timeout)
+        self._ready(timeout)
+        self._run_provision(timeout)
+        rc, out = self.sh('sync && echo 3 > /proc/sys/vm/drop_caches', root=True, timeout=60)
+        if rc != 0:
+            raise RuntimeError(f'preparing the snapshot failed: {out}')
+
+    def _run_provision(self, timeout):
+        """The provision script as root; its output goes to provision.log in the VM's directory."""
+        t0 = time.time()
+        rc, out = self.sh('bash -s', input=open(self.provision, 'rb').read(), root=True,
+                          timeout=self.provision_timeout)
+        out_log = os.path.join(self.dir, 'provision.log')
+        open(out_log, 'w').write(out)
+        if rc != 0:
+            tail = '\n'.join(out.splitlines()[-15:])
+            raise RuntimeError(f'provision script failed (exit {rc}); full output in {out_log}:\n{tail}')
+        log(f'provisioned in {time.time() - t0:.0f} s')
+
+    def _seal_provisioned(self, tmp):
+        for f in ('disk.qcow2', 'state'):
+            os.chmod(os.path.join(tmp, f), 0o444)
+        os.remove(os.path.join(tmp, 'qemu.log'))
+
     SNAPSHOT_HOW = 'cloud-init boot'
 
     def _prepare_snapshot(self, tmp, timeout):
         """Boot the VM that will be saved, in tmp, and leave it running."""
         self.key = os.path.join(tmp, 'id_vm')
         _keygen(self.key)
-        self._cold_boot(self.image, os.path.join(tmp, 'disk.qcow2'), tmp, timeout)
+        self._cold_boot(self.image, os.path.join(tmp, 'disk.qcow2'), tmp, timeout, self.BASE_HOSTNAME)
         # cloud-init never runs again; the journal also goes to the serial console, so console.log shows
         # what happened even when SSH drops.
         rc, out = self.sh(
@@ -747,6 +805,9 @@ def main(argv=None):
     up.add_argument('--hostname', default='testbox')
     up.add_argument('--owner', type=int, required=True,
                     help='stop the VM when this PID exits (bash: $$, not the $(...) subshell); 0 = keep running')
+    up.add_argument('--provision', metavar='SCRIPT',
+                    help='bash script run once as root with network on top of the base snapshot; saved as a '
+                         'second snapshot layer, rebuilt when the script changes')
     up.add_argument('--fresh', action='store_true', help='boot through cloud-init instead of the snapshot')
     up.add_argument('--timeout', type=int, default=300)
     win = sub.add_parser('up-windows', help='start a throwaway copy of a Windows golden image (vm/windows) in DIR')
@@ -783,7 +844,8 @@ def main(argv=None):
         return guard(a.owner, a.qemu[1:] if a.qemu[:1] == ['--'] else a.qemu)
     if a.cmd in ('up', 'up-windows'):
         if a.cmd == 'up':
-            vm = VM(a.dir, a.vm_dir, a.name, a.mem, a.cpus, a.disk_gb, a.hostname, owner=a.owner, fresh=a.fresh)
+            vm = VM(a.dir, a.vm_dir, a.name, a.mem, a.cpus, a.disk_gb, a.hostname, owner=a.owner, fresh=a.fresh,
+                    provision=a.provision)
         else:
             vm = WindowsVM(a.dir, a.vm_dir, a.golden, os.path.abspath(a.key), a.name, a.mem, a.cpus, a.ssh_port, a.vnc,
                            [os.path.abspath(t) for t in a.acpi_table], owner=a.owner, fresh=a.fresh)
