@@ -38,18 +38,30 @@ def free_port():
         return s.getsockname()[1]
 
 
-def ensure_image(cache_dir):
-    """Path of the verified cloud image in cache_dir, downloading it if missing or stale."""
+def ensure_image(cache_dir, recheck_s=3600):
+    """Path of the verified cloud image in cache_dir, downloading it if missing or stale. Parallel callers take turns
+    (a lock), and the checksums are fetched again only if the last check is older than recheck_s."""
     os.makedirs(cache_dir, exist_ok=True)
     run = functools.partial(subprocess.run, cwd=cache_dir, check=True)
-    run(['curl', '-fsS', '--max-time', '60', '-O', f'{URL}/SHA256SUMS', '-O', f'{URL}/SHA256SUMS.gpg'])
-    run(['gpgv', '--keyring', KEYRING, 'SHA256SUMS.gpg', 'SHA256SUMS'], capture_output=True)
-    check = _sum_line(cache_dir)
-    ok = subprocess.run(['sha256sum', '-c', '--status'], input=check, text=True, cwd=cache_dir).returncode == 0
-    if not ok:
-        run(['curl', '-fL', '--retry', '3', '--max-time', '1800', '-o', IMG, f'{URL}/{IMG}'])
-        run(['sha256sum', '-c'], input=check, text=True)
-    return os.path.join(cache_dir, IMG)
+    stamp, image = os.path.join(cache_dir, '.verified'), os.path.join(cache_dir, IMG)
+    with open(os.path.join(cache_dir, '.lock'), 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with contextlib.suppress(FileNotFoundError):
+            if time.time() - os.path.getmtime(stamp) < recheck_s and os.path.getmtime(image) <= os.path.getmtime(stamp):
+                return image
+        # New names first, then rename: _kind() of other VMs reads SHA256SUMS without the lock.
+        run(['curl', '-fsS', '--max-time', '60', '-o', 'SHA256SUMS.new', f'{URL}/SHA256SUMS',
+             '-o', 'SHA256SUMS.gpg.new', f'{URL}/SHA256SUMS.gpg'])
+        run(['gpgv', '--keyring', KEYRING, 'SHA256SUMS.gpg.new', 'SHA256SUMS.new'], capture_output=True)
+        for f in ('SHA256SUMS', 'SHA256SUMS.gpg'):
+            os.replace(os.path.join(cache_dir, f + '.new'), os.path.join(cache_dir, f))
+        check = _sum_line(cache_dir)
+        ok = subprocess.run(['sha256sum', '-c', '--status'], input=check, text=True, cwd=cache_dir).returncode == 0
+        if not ok:
+            run(['curl', '-fL', '--retry', '3', '--max-time', '1800', '-o', IMG, f'{URL}/{IMG}'])
+            run(['sha256sum', '-c'], input=check, text=True)
+        open(stamp, 'w').close()
+        return image
 
 
 def _sum_line(cache_dir):
