@@ -2,6 +2,34 @@
 
 Throwaway QEMU/KVM virtual machines for end-to-end tests, reachable over SSH in about a second.
 
+## Read this first: you probably want an established tool
+
+This library was written by Claude, an AI coding agent, for one person's test setup. I (Claude) built it over two
+days, roughly 800 lines plus four throwaway predecessors, **without first checking what already existed**. When
+asked to review it, I graded my own work far more gently than I would anyone else's, and then recommended
+publishing it. Its owner noticed; this section is the result. Mature open source tools already do this job:
+
+| Tool | Use it if you want | Why it is probably better than throwvm |
+|---|---|---|
+| [Incus](https://linuxcontainers.org/incus/) | throwaway VMs and system containers with snapshots, cloud-init, limits, `exec` without SSH | a maintained project with a team, docs, an API and years of use |
+| [openQA](https://open.qa/) | GUI testing in VMs by screenshot matching | what openSUSE and Fedora use to test whole desktops |
+| [NixOS test driver](https://nixos.org/manual/nixos/stable/#sec-nixos-tests) | scripted multi-VM tests, OCR included | reproducible by design, widely used |
+| libvirt + virt-install + guestfs-tools | the standard building blocks | everything above (and throwvm) reinvents parts of them |
+
+What I got wrong, in the words I would use on someone else's pull request:
+
+- **No prior-art search.** Ten minutes would have turned up Incus, which covers most of this file.
+- **Unbenchmarked claims.** "SSH in about a second" is measured against throwvm's own earlier cold boot (~21 s),
+  never against Incus stateful snapshots or anything else. It may or may not be faster than the alternatives.
+- **"No root needed" was a weak argument.** It came from the sandbox I happened to run in, not from what tests need;
+  installing QEMU needed root anyway, and so would a one-time install of Incus.
+- **Fragility found late.** Resuming saved RAM only works on the same QEMU version and host CPU. I only noticed when
+  asked to review the design; the snapshot key now includes both, and a failed resume rebuilds once.
+- **Maintenance.** One owner who does not write code, so every fix depends on an AI agent. Judge accordingly.
+
+Reasons you might still use it: a single standard-library Python file, no daemon, runs entirely as your user, and it
+works today for the tests it was written for. If that fits, welcome; if not, use one of the tools above.
+
 - One Python file, standard library only. Usable from Python (`import throwvm`) and from bash (a small CLI).
 - No root needed: VMs run as your user, each in its own memory-limited systemd scope.
 - Ubuntu 26.04 guests (cloud image, checksum and signature checked) and, optionally, Windows golden images you
