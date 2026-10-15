@@ -72,6 +72,22 @@ def ensure_image(cache_dir, recheck_s=3600):
         return image
 
 
+@functools.cache
+def host_identity():
+    """What a saved RAM and device state depends on besides the VM itself: QEMU's version and the host CPU (VMs
+    run with -cpu host). Part of every snapshot key, so a QEMU upgrade or another machine makes a new snapshot."""
+    qemu = subprocess.run(['qemu-system-x86_64', '--version'], capture_output=True, text=True, timeout=30,
+                          check=True).stdout.splitlines()[0].strip()
+    model = flags = ''
+    for line in open('/proc/cpuinfo'):
+        key, _, value = line.partition(':')
+        if key.strip() == 'model name' and not model:
+            model = value.strip()
+        elif key.strip() == 'flags' and not flags:
+            flags = ' '.join(sorted(value.split()))
+    return [qemu, model, hashlib.sha256(flags.encode()).hexdigest()[:16]]
+
+
 def _sum_line(cache_dir):
     line = next(l for l in open(os.path.join(cache_dir, 'SHA256SUMS')) if l.rstrip().endswith('*' + IMG))
     return line.replace('*', '')
@@ -184,9 +200,11 @@ class VM:
     BASE_HOSTNAME = 'throwvm'   # in the shared base snapshot; each VM sets its own hostname on resume
 
     def __init__(self, workdir, vm_dir, name='vm', mem_mb=3072, cpus=2, disk_gb=20, hostname='testbox',
-                 owner=None, fresh=False, provision=None, provision_timeout=1800):
+                 owner=None, fresh=False, provision=None, provision_timeout=1800, max_age_days=7):
         """provision: a script run once as root (bash, with network) on top of the base snapshot; the result is saved as
-        a second snapshot layer, rebuilt when the script changes."""
+        a second snapshot layer, rebuilt when the script changes or is older than max_age_days (0: never), so the
+        packages it installed do not stay frozen."""
+        self.max_age_s = max_age_days * 86400 if max_age_days else None
         self.dir, self.vm_dir, self.name = os.path.abspath(workdir), vm_dir, name
         self.provision = os.path.abspath(provision) if provision else None
         self.provision_timeout = provision_timeout
@@ -195,6 +213,7 @@ class VM:
         self.ssh_port = self.unit = self.key = self.proc = self.image = None
         self.fixed_port = None                                    # set: always forward this host port to SSH
         self.made_snapshot = False
+        self.made = set()               # snapshots made by this process: a failed resume of one is not retried
 
     # -- state shared with the CLI
     KIND = 'ubuntu'
@@ -230,12 +249,7 @@ class VM:
             if self.fresh:
                 self._fresh_boot(timeout)
             else:
-                snap = self._snapshot(timeout)
-                ram = os.path.join(snap, 'ram')
-                self._start(self._overlay(snap), self.dir, incoming=True,
-                            ram=(ram, False) if os.path.exists(ram) else None)
-                self._resume(self.dir, snap, timeout)
-                self._ready(timeout)
+                self._resume_copy(lambda: self._snapshot(timeout), self.dir, timeout)
         except BaseException:
             self.stop(failed=True)
             raise
@@ -255,10 +269,10 @@ class VM:
         if self.provision:
             self._run_provision(timeout)
 
-    def _overlay(self, snap):
-        """Set up this VM's files on top of the snapshot; returns the disk to start."""
+    def _overlay(self, snap, d):
+        """Set up the VM's files in d on top of the snapshot; returns the disk to start."""
         self.key = os.path.join(snap, 'id_vm')
-        disk = os.path.join(self.dir, 'disk.qcow2')
+        disk = os.path.join(d, 'disk.qcow2')
         _run(['qemu-img', 'create', '-q', '-f', 'qcow2', '-F', 'qcow2', '-b', os.path.join(snap, 'disk.qcow2'), disk])
         return disk
 
@@ -305,29 +319,36 @@ class VM:
     def _kind(self):
         """What a snapshot depends on: VMs of the same kind share one."""
         sums = _sum_line(os.path.dirname(self.image)).split()[0]
-        return [LAYOUT, sums, self.mem_mb, self.cpus, self.disk_gb]
+        return [LAYOUT, sums, *host_identity(), self.mem_mb, self.cpus, self.disk_gb]
+
+    def _base(self, timeout):
+        """The base snapshot: the VM just after it booted, shared by every VM of a kind."""
+        return self._layer(self.KIND, self._kind(), self.SNAPSHOT_HOW, self._prepare_snapshot, self._seal_snapshot,
+                           timeout)
 
     def _snapshot(self, timeout):
-        """Directory of the saved VM to resume: the base snapshot (just after boot, shared by every VM of a kind),
-        or with provision the layer on top of it."""
-        base = self._layer(self.KIND, self._kind(), self.SNAPSHOT_HOW, self._prepare_snapshot, self._seal_snapshot,
-                           timeout)
+        """Directory of the saved VM to resume: the base snapshot, or with provision the layer on top of it."""
+        base = self._base(timeout)
         if not self.provision:
             return base
         script = hashlib.sha256(open(self.provision, 'rb').read()).hexdigest()
         return self._layer(self.name, [os.path.basename(base), script],
                            f'resume {os.path.basename(base)}, run {os.path.basename(self.provision)}',
-                           functools.partial(self._prepare_provisioned, base), self._seal_provisioned, timeout)
+                           self._prepare_provisioned, self._seal_provisioned, timeout, max_age_s=self.max_age_s)
 
-    def _layer(self, prefix, kind, how, prepare, seal, timeout):
+    def _layer(self, prefix, kind, how, prepare, seal, timeout, max_age_s=None):
         """vm_dir/snapshots/<prefix>-<hash of kind>: made once (prepare boots a VM in a temporary directory, which is
-        then saved and sealed); later calls only mark it used, for prune."""
+        then saved and sealed), and again once it is older than max_age_s; later calls only mark it used, for prune."""
         snaps = os.path.join(self.vm_dir, 'snapshots')
         snap = os.path.join(snaps, f'{prefix}-{hashlib.sha256(json.dumps(kind).encode()).hexdigest()[:12]}')
         os.makedirs(snaps, exist_ok=True)
         with open(snap + '.lock', 'w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)          # a second run of the same kind waits for the first to finish
-            if os.path.exists(os.path.join(snap, 'state')):
+            state = os.path.join(snap, 'state')
+            if os.path.exists(state) and max_age_s and time.time() - os.path.getmtime(state) > max_age_s:
+                log(f'snapshot {os.path.basename(snap)} is older than {max_age_s / 86400:g} days: making it again')
+                _discard_locked(snap)
+            if os.path.exists(state):
                 os.utime(snap)
                 return snap
             log(f'preparing snapshot {os.path.basename(snap)} (once: {how}, then save disk and RAM)')
@@ -345,19 +366,41 @@ class VM:
                 self._stop_unit()
                 shutil.rmtree(tmp, ignore_errors=True)
                 raise
+            self.made.add(snap)
             log(f'snapshot ready: {os.path.getsize(os.path.join(snap, "state")) // 2**20} MiB RAM state')
             return snap
 
-    def _prepare_provisioned(self, base, tmp, timeout):
+    def _resume_copy(self, get_snap, d, timeout):
+        """Resume a copy of the snapshot get_snap() returns, in d. If that fails for a snapshot made earlier (it no
+        longer fits this host, or its files are damaged), discard it, make it again and retry once."""
+        snap = get_snap()
+        try:
+            self._resume_in(snap, d, timeout)
+        except Exception as e:
+            if snap in self.made:
+                raise
+            log(f'resuming snapshot {os.path.basename(snap)} failed ({str(e).strip()[:200]}); '
+                'discarding it and making it again')
+            self._stop_unit()
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(os.path.join(d, 'disk.qcow2'))
+            discard(snap)
+            snap = get_snap()
+            self._resume_in(snap, d, timeout)
+        return snap
+
+    def _resume_in(self, snap, d, timeout):
+        ram = os.path.join(snap, 'ram')
+        self._start(self._overlay(snap, d), d, incoming=True, ram=(ram, False) if os.path.exists(ram) else None)
+        self._resume(d, snap, timeout)
+        self._ready(timeout)
+
+    def _prepare_provisioned(self, tmp, timeout):
         """Resume the base snapshot in tmp and run the provision script in it."""
+        base = self._resume_copy(lambda: self._base(timeout), tmp, timeout)
         for f in ('id_vm', 'id_vm.pub'):
             shutil.copy2(os.path.join(base, f), os.path.join(tmp, f))
         self.key = os.path.join(tmp, 'id_vm')
-        disk = os.path.join(tmp, 'disk.qcow2')
-        _run(['qemu-img', 'create', '-q', '-f', 'qcow2', '-F', 'qcow2', '-b', os.path.join(base, 'disk.qcow2'), disk])
-        self._start(disk, tmp, incoming=True)
-        self._resume(tmp, base, timeout)
-        self._ready(timeout)
         self._run_provision(timeout)
         rc, out = self.sh('sync && echo 3 > /proc/sys/vm/drop_caches', root=True, timeout=60)
         if rc != 0:
@@ -561,10 +604,10 @@ class WindowsVM(VM):
 
     The golden image is a directory with disk.qcow2 (Windows with OpenSSH Server accepting `key` for an
     administrator `tester`, auto-logon to the desktop), vars.fd (its OVMF NVRAM vars) and tpm/ (its swtpm state).
-    The machine must match the one it was installed on: UEFI Secure Boot (OVMF code + a copy of the image's NVRAM vars), a swtpm TPM 2.0 that
-    runs inside the VM's scope, AHCI disk, e1000e NIC. The snapshot of a golden image is its first boot, saved once
-    the desktop is up and the guest has gone quiet. The firmware vars (pflash) and the TPM state (QEMU's
-    tpm-emulator backend) are saved with the RAM, so on resume they match the running Windows exactly.
+    The machine must match the one it was installed on: UEFI Secure Boot (OVMF code + a copy of the image's NVRAM
+    vars), a swtpm TPM 2.0 that runs inside the VM's scope, AHCI disk, e1000e NIC. The snapshot of a golden image
+    is its first boot, saved once the desktop is up and the guest has gone quiet. The firmware vars (pflash) and the
+    TPM state (QEMU's tpm-emulator backend) are saved with the RAM, so on resume they match the running Windows.
     """
     KIND = 'windows'
     SAVED = VM.SAVED + ('golden',)
@@ -595,7 +638,7 @@ class WindowsVM(VM):
         files = [os.path.join(self.golden, f) for f in ('disk.qcow2', 'vars.fd')] + sorted(
             glob.glob(os.path.join(self.golden, 'tpm', '*'))) + self.acpi_tables
         sig = [(os.path.basename(f), (st := os.stat(f)).st_size, st.st_mtime_ns) for f in files]
-        return [WINDOWS_LAYOUT, self.golden, sig, self.mem_mb, self.cpus]
+        return [WINDOWS_LAYOUT, self.golden, sig, *host_identity(), self.mem_mb, self.cpus]
 
     def _machine_files(self, src, d):
         """d gets an overlay disk on src's disk and copies of its firmware vars and TPM state."""
@@ -611,8 +654,8 @@ class WindowsVM(VM):
         self._start(self._machine_files(self.golden, self.dir), self.dir)
         self._wait_ssh(timeout)
 
-    def _overlay(self, snap):
-        return self._machine_files(snap, self.dir)
+    def _overlay(self, snap, d):
+        return self._machine_files(snap, d)
 
     def _prepare_snapshot(self, tmp, timeout):
         # The RAM is a file from the start: saving the snapshot then only writes the device state, and resuming maps
@@ -744,6 +787,20 @@ def _tpm_live(d):
                         .hexdigest()[:16])
 
 
+def discard(snap):
+    """Delete a snapshot (under its lock). VMs running from it keep their open files."""
+    with open(snap + '.lock', 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _discard_locked(snap)
+
+
+def _discard_locked(snap):
+    if os.path.isdir(snap):
+        bad = f'{snap}.discarded-{os.getpid()}'
+        os.rename(snap, bad)                         # gone at once for other runs, then deleted
+        shutil.rmtree(bad, ignore_errors=True)
+
+
 def _qmp_path(d):
     """QMP socket of the VM in directory d: unix socket paths must stay under 108 bytes."""
     run = os.environ.get('XDG_RUNTIME_DIR') or '/tmp'
@@ -814,6 +871,8 @@ def main(argv=None):
     up.add_argument('--provision', metavar='SCRIPT',
                     help='bash script run once as root with network on top of the base snapshot; saved as a '
                          'second snapshot layer, rebuilt when the script changes')
+    up.add_argument('--max-age-days', type=float, default=7,
+                    help='make the provision layer again once it is older than this (0: never; default 7)')
     up.add_argument('--fresh', action='store_true', help='boot through cloud-init instead of the snapshot')
     up.add_argument('--timeout', type=int, default=300)
     win = sub.add_parser('up-windows', help='start a throwaway copy of a Windows golden image in DIR')
@@ -827,7 +886,8 @@ def main(argv=None):
     win.add_argument('--cpus', type=int, default=4)
     win.add_argument('--ssh-port', type=int, help='fixed host port for SSH (default: a free one)')
     win.add_argument('--vnc', type=int, help='VNC display on 127.0.0.1')
-    win.add_argument('--acpi-table', action='append', default=[], help='extra ACPI table file, e.g. the host\'s MSDM (OEM licence key)')
+    win.add_argument('--acpi-table', action='append', default=[],
+                     help="extra ACPI table file, e.g. the host's MSDM (OEM licence key)")
     win.add_argument('--owner', type=int, required=True, help='as for up')
     win.add_argument('--fresh', action='store_true', help='cold-boot the golden image instead of the snapshot')
     win.add_argument('--timeout', type=int, default=600)
@@ -851,7 +911,7 @@ def main(argv=None):
     if a.cmd in ('up', 'up-windows'):
         if a.cmd == 'up':
             vm = VM(a.dir, a.vm_dir, a.name, a.mem, a.cpus, a.disk_gb, a.hostname, owner=a.owner, fresh=a.fresh,
-                    provision=a.provision)
+                    provision=a.provision, max_age_days=a.max_age_days)
         else:
             vm = WindowsVM(a.dir, a.vm_dir, a.golden, os.path.abspath(a.key), a.name, a.mem, a.cpus, a.ssh_port, a.vnc,
                            [os.path.abspath(t) for t in a.acpi_table], owner=a.owner, fresh=a.fresh)

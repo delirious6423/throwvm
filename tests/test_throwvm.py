@@ -1,9 +1,12 @@
 """Offline tests for throwvm.py (no VM is started). Run: python3 -I -m unittest discover -s tests -p 'test_*.py'"""
+import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 LIB = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(LIB))
@@ -81,6 +84,102 @@ class WindowsMachine(unittest.TestCase):
             del j["kind"], j["golden"]
             json.dump(j, open(f"{d}/vm.json", "w"))
             self.assertIs(type(throwvm.VM.load(d)), throwvm.VM)
+
+
+class SnapshotKey(unittest.TestCase):
+    def kind(self, identity):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(throwvm, "host_identity", return_value=identity):
+            Path(d, "SHA256SUMS").write_text(f"abc *{throwvm.IMG}\n")
+            vm = throwvm.VM(d, d)
+            vm.image = os.path.join(d, throwvm.IMG)
+            return vm._kind()
+
+    def test_qemu_version_and_host_cpu_are_part_of_the_key(self):
+        a = self.kind(["QEMU emulator version 10.2.1", "CPU A", "flags1"])
+        self.assertNotEqual(a, self.kind(["QEMU emulator version 10.3.0", "CPU A", "flags1"]))
+        self.assertNotEqual(a, self.kind(["QEMU emulator version 10.2.1", "CPU B", "flags1"]))
+        self.assertNotEqual(a, self.kind(["QEMU emulator version 10.2.1", "CPU A", "flags2"]))
+        self.assertEqual(a, self.kind(["QEMU emulator version 10.2.1", "CPU A", "flags1"]))
+
+    def test_host_identity_reads_this_host(self):
+        qemu, model, flags = throwvm.host_identity()
+        self.assertIn("QEMU", qemu)
+        self.assertTrue(model and len(flags) == 16)
+
+
+class FakeVM(throwvm.VM):
+    """Snapshots are directories with a state file; resuming fails while resume_failures > 0."""
+
+    def __init__(self, d):
+        super().__init__(os.path.join(d, "work"), d, name="t", owner=0)
+        self.made_count, self.resume_failures, self.resumed = 0, 0, []
+
+    def _base(self, timeout):
+        return self._layer("base", ["k"], "test", self._prepare, lambda tmp: None, timeout)
+
+    def _prepare(self, tmp, timeout):
+        self.made_count += 1
+
+    def _save_state(self, d, path):
+        Path(path).write_text("state")
+
+    def _stop_unit(self):
+        pass
+
+    def _resume_in(self, snap, d, timeout):
+        if self.resume_failures:
+            self.resume_failures -= 1
+            raise RuntimeError("load of migration failed")
+        self.resumed.append(snap)
+
+
+class ResumeFallback(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def vm(self):
+        return FakeVM(self.tmp.name)
+
+    def test_old_snapshot_that_fails_to_resume_is_made_again_once(self):
+        self.vm()._base(10)                       # made by an earlier run
+        vm = self.vm()
+        vm.resume_failures = 1
+        snap = vm._resume_copy(lambda: vm._base(10), vm.dir, 10)
+        self.assertEqual(vm.made_count, 1)        # discarded and made again
+        self.assertEqual(vm.resumed, [snap])
+        self.assertTrue(os.path.exists(os.path.join(snap, "state")))
+
+    def test_gives_up_when_the_new_snapshot_fails_too(self):
+        self.vm()._base(10)
+        vm = self.vm()
+        vm.resume_failures = 2
+        with self.assertRaises(RuntimeError):
+            vm._resume_copy(lambda: vm._base(10), vm.dir, 10)
+        self.assertEqual(vm.made_count, 1)
+
+    def test_snapshot_made_by_this_run_is_not_made_twice(self):
+        vm = self.vm()
+        vm.resume_failures = 1
+        with self.assertRaises(RuntimeError):
+            vm._resume_copy(lambda: vm._base(10), vm.dir, 10)
+        self.assertEqual(vm.made_count, 1)
+
+
+class MaxAge(unittest.TestCase):
+    def test_layer_older_than_max_age_is_made_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            vm = FakeVM(d)
+            layer = lambda age: vm._layer("p", ["k"], "test", vm._prepare, lambda tmp: None, 10, max_age_s=age)
+            snap = layer(86400)
+            old = time.time() - 2 * 86400
+            os.utime(os.path.join(snap, "state"), (old, old))
+            layer(None)                           # no max age: kept
+            self.assertEqual(vm.made_count, 1)
+            layer(86400)                          # older than a day: made again
+            self.assertEqual(vm.made_count, 2)
+            layer(86400)                          # fresh again
+            self.assertEqual(vm.made_count, 2)
 
 
 if __name__ == "__main__":
