@@ -130,6 +130,21 @@ administrator `tester` and auto-logon. It needs `ovmf` and `swtpm`. The snapshot
 its RAM is a file that VMs map copy-on-write, so a 6 GiB Windows resumes in ~3 s. The snapshot holds the guest RAM
 (with the auto-logon password) and is readable by you only. You need a Windows licence for every copy you run.
 
+## Arm64 VMs on a Mac
+
+On an Apple Silicon Mac you reach as `ssh HOST` (key login), throwvm runs VMs there and gives you SSH to them through
+the Mac (`-J HOST`). No snapshots or cgroups: each VM is an APFS clone, so it starts in seconds and costs no disk
+until written. `--owner` works as on Linux.
+
+- `up-mac DIR --host imac --base BASE`: a [Tart](https://tart.run) VM (macOS or Linux) cloned from the local Tart
+  VM `BASE`; the key goes in through Tart's guest agent (`tart exec`), so no password. Needs Tart on the Mac's PATH.
+- `up-mac-windows DIR --host imac --golden DIR_ON_MAC --key KEY`: a copy of a Windows on Arm golden image
+  (`disk.raw`, `vars.fd`, `code.fd` = Ubuntu's AAVMF firmware) run by the QEMU in UTM.app with Apple's hypervisor.
+  UTM's own launcher only runs inside the app, so throwvm compiles a small `~/bin/qemu-launch` on the Mac and signs
+  it for the hypervisor (needs the Xcode command line tools). The display is ramfb: Windows 11 26H2's boot manager
+  draws straight to the framebuffer, which virtio-gpu lacks. Building the golden image is up to you (an unattended
+  install, e.g. [dotfiles' vm/windows-arm](https://github.com/delirious6423/dotfiles/tree/main/vm/windows-arm)).
+
 ## Pinning a version in another project
 
 Fetch a tagged `throwvm.py` and check it against a pinned sha256, so a project's test does not depend on anything

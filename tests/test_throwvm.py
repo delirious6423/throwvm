@@ -86,6 +86,58 @@ class WindowsMachine(unittest.TestCase):
             self.assertIs(type(throwvm.VM.load(d)), throwvm.VM)
 
 
+class MacMachines(unittest.TestCase):
+    def test_load_round_trips_both_mac_kinds(self):
+        with tempfile.TemporaryDirectory() as d:
+            vm = throwvm.MacVM(d, "imac", "ubuntu-base", "/key")
+            vm.ip = "192.168.64.5"
+            vm._save()
+            loaded = throwvm.VM.load(d)
+            self.assertIs(type(loaded), throwvm.MacVM)
+            self.assertEqual((loaded.host, loaded.base, loaded.key, loaded.user, loaded.ip, loaded.owner),
+                             ("imac", "ubuntu-base", "/key", "admin", "192.168.64.5", 0))
+            win = throwvm.MacWindowsVM(d, "imac", "VMs/windows-arm/golden", "/key", ssh_port=2240, vnc=40)
+            win._save()
+            loaded = throwvm.VM.load(d)
+            self.assertIs(type(loaded), throwvm.MacWindowsVM)
+            self.assertEqual((loaded.golden, loaded.ssh_port, loaded.vnc), ("VMs/windows-arm/golden", 2240, 40))
+
+    def test_ssh_goes_through_the_mac(self):
+        vm = throwvm.MacVM("/w/run1", "imac", "base", "/key")
+        vm.ip = "192.168.64.5"
+        argv = vm.ssh_argv()
+        self.assertEqual(argv[argv.index("-J") + 1], "imac")
+        self.assertEqual(argv[-1], "admin@192.168.64.5")
+        self.assertEqual(vm.vm, "throwvm-run1")
+        win = throwvm.MacWindowsVM("/w/run1", "imac", "g", "/key", ssh_port=2240).ssh_argv()
+        self.assertEqual(win[-3:], ["-p", "2240", "tester@127.0.0.1"])
+
+    def test_windows_boots_from_its_own_firmware_copy_with_a_linear_framebuffer(self):
+        args = throwvm.MacWindowsVM("/w/run1", "imac", "g", "/key", ssh_port=2240).qemu_args()
+        r = "VMs/throwvm/throwvm-run1"
+        self.assertIn(f"if=pflash,format=raw,readonly=on,file={r}/code.fd", args)
+        self.assertIn(f"if=pflash,format=raw,file={r}/vars.fd", args)
+        # Windows 11 26H2's boot manager writes to the framebuffer directly; virtio-gpu has none
+        self.assertIn("ramfb", args)
+        self.assertNotIn("virtio-gpu-pci", args)
+        self.assertIn("user,id=n0,hostfwd=tcp:127.0.0.1:2240-:22", args)
+        self.assertNotIn("-vnc", args)
+        for a in args:   # boot() wraps each argument in double quotes for the Mac's shell
+            self.assertFalse(set(a) & set('"`\\'), a)
+
+    def test_stop_deletes_the_copy_and_keeps_the_log_on_failure(self):
+        vm = throwvm.MacVM("/w/run1", "imac", "base", "/key")
+        with mock.patch.object(vm, "mac") as mac:
+            vm.stop()
+        self.assertIn("tart stop throwvm-run1", mac.call_args[0][0])
+        self.assertIn("tart delete throwvm-run1", mac.call_args[0][0])
+        win = throwvm.MacWindowsVM("/w/run1", "imac", "g", "/key")
+        with mock.patch.object(win, "mac") as mac, mock.patch.object(win, "monitor"):
+            win.stop(failed=True)
+        self.assertIn("rm -f VMs/throwvm/throwvm-run1/disk.raw", mac.call_args[0][0])
+        self.assertNotIn("rm -rf", mac.call_args[0][0])
+
+
 class SnapshotKey(unittest.TestCase):
     def kind(self, identity):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(throwvm, "host_identity", return_value=identity):
