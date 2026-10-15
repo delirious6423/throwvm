@@ -49,15 +49,25 @@ vm.stop(failed=rc != 0, remove=rc == 0)
 
 | Layer | Made from | Key (rebuilt when it changes) | Directory in `vm_dir/snapshots` |
 |---|---|---|---|
-| base | the cloud image, booted through cloud-init | image checksum, RAM, CPUs, disk size | `ubuntu-<hash>` |
-| provisioned | the base, plus your `--provision` script run as root with network | base + sha256 of the script | `<name>-<hash>` |
+| base | the cloud image, booted through cloud-init | image checksum, QEMU version, host CPU, RAM, CPUs, disk size | `ubuntu-<hash>` |
+| provisioned | the base, plus your `--provision` script run as root with network | base + sha256 of the script; made again after 7 days | `<name>-<hash>` |
 
 A VM resumes the top layer. Its clock and hostname are set on resume. Projects with different provision scripts
 share the base. Snapshots are made under a lock, so parallel runs wait for the first one instead of building twice.
 `throwvm.py prune --days 14` deletes snapshots not used for 14 days.
 
-All VMs resumed from a snapshot share its SSH key and SSH host keys (they are throwaway test machines on
-127.0.0.1); the guest's random number generator is reseeded on resume (vmgenid, virtio-rng).
+- **Host:** a saved RAM state only resumes on the QEMU version and CPU it was made on (VMs run with `-cpu host`),
+  so both are part of the key: after a QEMU upgrade, or on another machine, the snapshots are made again.
+- **Failed resume:** if resuming a snapshot made earlier fails anyway, throwvm logs it, discards that snapshot,
+  makes it again and retries once, instead of failing the test.
+- **Age:** a provision layer freezes the package versions it installed. It is made again on the first use after 7
+  days (`--max-age-days` / `max_age_days`; 0 = never), so tests follow current packages. The base follows the
+  cloud image: a new image release changes its checksum and with it the key.
+
+VMs resumed from one snapshot are identical twins: same machine-id, SSH host keys and SSH key. Each VM has its own
+isolated user-mode network (reachable only through its forwarded port on 127.0.0.1), so this is harmless for
+single-VM tests; it matters only for tests where several VMs talk to each other. The guest's random number
+generator is reseeded on resume (vmgenid, virtio-rng).
 
 ## Memory and CPU
 
