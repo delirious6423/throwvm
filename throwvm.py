@@ -167,6 +167,7 @@ class VM:
         self.mem_mb, self.cpus, self.disk_gb, self.hostname, self.fresh = mem_mb, cpus, disk_gb, hostname, fresh
         self.owner = os.getpid() if owner is None else owner      # 0: nobody, the VM runs until stopped
         self.ssh_port = self.unit = self.key = self.proc = None
+        self.made_snapshot = False
 
     # -- state shared with the CLI
     def _save(self):
@@ -218,7 +219,8 @@ class VM:
             self.stop(failed=True)
             raise
         self._save()
-        log(f'VM up in {time.time() - t0:.1f} s ({"fresh" if self.fresh else "from snapshot"}), unit {self.unit}')
+        how = 'fresh' if self.fresh else 'snapshot made, then resumed' if self.made_snapshot else 'from snapshot'
+        log(f'VM up in {time.time() - t0:.1f} s ({how}), unit {self.unit}')
         return self
 
     def _seed(self, d):
@@ -263,6 +265,7 @@ class VM:
                 os.utime(snap)                        # last use, for prune
                 return snap
             log(f'preparing snapshot {os.path.basename(snap)} (once: cloud-init boot, then save disk and RAM)')
+            self.made_snapshot = True
             tmp = f'{snap}.tmp-{os.getpid()}'
             shutil.rmtree(tmp, ignore_errors=True)
             os.makedirs(tmp)
