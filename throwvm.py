@@ -14,6 +14,9 @@ Bash: `eval "$(lib/throwvm.py up DIR --vm-dir ... --owner $$)"`, then `"${VM_SSH
   otherwise it waits. Starts are serialized by a lock file.
 - The VM is stopped when its owner process exits (a guard process watches it), so no VM outlives a killed run.
 - On failure `stop(failed=True)` keeps console.log, qemu.log and the guest journal; only the disk is deleted.
+- `WindowsVM` (CLI: `up-windows`): the same for a Windows golden image built by vm/windows/build.sh, with UEFI
+  Secure Boot and a swtpm TPM in the scope. Its snapshot keeps the RAM as a file that VMs map copy-on-write, so a
+  6 GiB Windows resumes in ~3 s instead of booting in ~15 s.
 """
 import argparse, contextlib, ctypes, fcntl, functools, glob, hashlib, http.server, json, os, select, shlex, shutil, \
     signal, socket, subprocess, sys, threading, time
@@ -23,6 +26,7 @@ IMG = f'ubuntu-{VERSION}-server-cloudimg-amd64.img'
 URL = f'https://cloud-images.ubuntu.com/releases/{RELEASE}/release'
 KEYRING = '/usr/share/keyrings/ubuntu-cloudimage-keyring.gpg'
 LAYOUT = 1               # bump when the QEMU command line or the snapshot preparation changes: old snapshots go stale
+WINDOWS_LAYOUT = 1       # the same for WindowsVM snapshots
 OVERHEAD_MB = 1024       # MemoryMax = guest RAM + this (QEMU itself, page cache of the disk files)
 HIGH_MB = 512            # MemoryHigh = guest RAM + this: above it the kernel reclaims the scope's page cache first
 RESERVE_MB = int(os.environ.get('THROWVM_RESERVE_MB', 4096))   # RAM always left free for the host
@@ -194,7 +198,10 @@ class VM:
     def load(workdir):
         """The VM started in workdir (by this or another process), owned by nobody."""
         d = json.load(open(os.path.join(workdir, 'vm.json')))
-        vm = VM(workdir, d['vm_dir'], d['name'], d['mem_mb'], d['cpus'], d['disk_gb'], d['hostname'], owner=0)
+        if d.get('kind') == WindowsVM.KIND:
+            vm = WindowsVM(workdir, d['vm_dir'], d['golden'], d['key'], d['name'], d['mem_mb'], d['cpus'], owner=0)
+        else:
+            vm = VM(workdir, d['vm_dir'], d['name'], d['mem_mb'], d['cpus'], d['disk_gb'], d['hostname'], owner=0)
         vm.ssh_port, vm.unit, vm.key = d['ssh_port'], d['unit'], d['key']
         return vm
 
@@ -487,6 +494,192 @@ class VM:
                 os.remove(_qmp_path(d))
 
 
+class WindowsVM(VM):
+    """Throwaway copy of a Windows golden image (vm/windows/build.sh); SSH lands in PowerShell as tester.
+
+    The machine is build.sh's: UEFI Secure Boot (OVMF code + a copy of the image's NVRAM vars), a swtpm TPM 2.0 that
+    runs inside the VM's scope, AHCI disk, e1000e NIC. The snapshot of a golden image is its first boot, saved once
+    the desktop is up and the guest has gone quiet. The firmware vars (pflash) and the TPM state (QEMU's
+    tpm-emulator backend) are saved with the RAM, so on resume they match the running Windows exactly.
+    """
+    KIND = 'windows'
+    SAVED = VM.SAVED + ('golden',)
+    SNAPSHOT_HOW = 'Windows boot until the desktop is idle'
+    OVMF_CODE = '/usr/share/OVMF/OVMF_CODE_4M.secboot.fd'
+    # Starts swtpm (args: live TPM dir, QEMU argv), waits for its control socket, then becomes QEMU. With
+    # --terminate swtpm exits when QEMU disconnects; stopping the scope stops both anyway.
+    TPM_WRAPPER = ('t=$1; shift; swtpm socket --tpm2 --terminate --tpmstate "dir=$t" '
+                   '--ctrl "type=unixio,path=$t/swtpm.sock" --log "file=$t/swtpm.log" & '
+                   'i=0; until [ -S "$t/swtpm.sock" ]; do i=$((i+1)); '
+                   '[ $i -lt 100 ] || { echo "swtpm did not start" >&2; exit 1; }; sleep 0.05; done; exec "$@"')
+
+    def __init__(self, workdir, vm_dir, golden, key, name='windows', mem_mb=6144, cpus=4, ssh_port=None, vnc=None,
+                 acpi_tables=(), owner=None, fresh=False, settle_s=180):
+        super().__init__(workdir, vm_dir, name, mem_mb, cpus, disk_gb=None, hostname=None, owner=owner, fresh=fresh)
+        self.golden, self.key, self.fixed_port, self.vnc = os.path.abspath(golden), key, ssh_port, vnc
+        self.acpi_tables, self.settle_s = list(acpi_tables), settle_s
+
+    def _check(self):
+        for f in ('disk.qcow2', 'vars.fd', 'tpm'):
+            if not os.path.exists(os.path.join(self.golden, f)):
+                raise RuntimeError(f'no {f} in the golden image {self.golden} (run vm/windows/build.sh)')
+        if not shutil.which('swtpm') or not os.path.exists(self.OVMF_CODE):
+            raise RuntimeError('needs swtpm and ovmf (apt install swtpm ovmf)')
+
+    def _kind(self):
+        # Files by size and mtime only: the ACPI tables (the OEM licence key) are never read here.
+        files = [os.path.join(self.golden, f) for f in ('disk.qcow2', 'vars.fd')] + sorted(
+            glob.glob(os.path.join(self.golden, 'tpm', '*'))) + self.acpi_tables
+        sig = [(os.path.basename(f), (st := os.stat(f)).st_size, st.st_mtime_ns) for f in files]
+        return [WINDOWS_LAYOUT, self.golden, sig, self.mem_mb, self.cpus]
+
+    def _machine_files(self, src, d):
+        """d gets an overlay disk on src's disk and copies of its firmware vars and TPM state."""
+        disk = os.path.join(d, 'disk.qcow2')
+        _run(['qemu-img', 'create', '-q', '-f', 'qcow2', '-F', 'qcow2', '-b', os.path.join(src, 'disk.qcow2'), disk])
+        shutil.copyfile(os.path.join(src, 'vars.fd'), os.path.join(d, 'vars.fd'))
+        os.chmod(os.path.join(d, 'vars.fd'), 0o600)
+        shutil.rmtree(os.path.join(d, 'tpm'), ignore_errors=True)
+        shutil.copytree(os.path.join(src, 'tpm'), os.path.join(d, 'tpm'))
+        return disk
+
+    def _fresh_boot(self, timeout):
+        self._start(self._machine_files(self.golden, self.dir), self.dir)
+        self._wait_ssh(timeout)
+
+    def _overlay(self, snap):
+        return self._machine_files(snap, self.dir)
+
+    def _prepare_snapshot(self, tmp, timeout):
+        # The RAM is a file from the start: saving the snapshot then only writes the device state, and resuming maps
+        # the file instead of loading ~5 GiB.
+        self._start(self._machine_files(self.golden, tmp), tmp, ram=(os.path.join(tmp, 'ram'), True))
+        self._wait_ssh(timeout)
+        end = time.time() + timeout
+        while self.sh('if (Get-Process explorer -EA 0) { exit 0 } else { exit 1 }', timeout=30)[0] != 0:
+            if time.time() > end:
+                raise RuntimeError('no desktop (explorer.exe) after boot')
+            time.sleep(1)
+        # Startup work (services, scheduled tasks, Defender) goes on for a while after logon. Save once the VM's
+        # CPU use stays low, so a resumed VM does not redo it at the start of every test.
+        t0, last = time.time(), self.stats()['cpu_s']
+        while time.time() - t0 < self.settle_s:
+            time.sleep(5)
+            now = self.stats()['cpu_s']
+            # Under half a CPU for 5 s. A cold-booted Windows here idles at ~0.4 CPU (QEMU included) with bursts.
+            if time.time() - t0 >= 20 and now - last < 5 * 0.5:
+                break
+            last = now
+        log(f'saving after {time.time() - t0:.0f} s of settling')
+
+    def _seal_snapshot(self, tmp):
+        # state holds the guest RAM (with the auto-logon password) and the ACPI tables: owner-only.
+        for f in ('disk.qcow2', 'vars.fd', 'state', 'ram'):
+            os.chmod(os.path.join(tmp, f), 0o400)
+        for f in ('qemu.log', 'swtpm.log'):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(os.path.join(tmp, f))
+
+    # Prints the guest clock, reads the host's correction from stdin and applies it: one PowerShell start (~1.5 s
+    # each over SSH) both shows that SSH works and sets the clock, to within the time the line takes to arrive.
+    CLOCK_PS = ('[Console]::Out.WriteLine([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()); [Console]::Out.Flush(); '
+                '$lag = [Console]::In.ReadLine(); Set-Date -Adjust ([TimeSpan]::FromMilliseconds([long]$lag)) | Out-Null')
+
+    def _ready(self, timeout):
+        end = time.time() + timeout
+        while not self._set_clock():
+            if time.time() > end or self.proc.poll() is not None:
+                raise RuntimeError(f'VM did not come up (see {self.dir}/qemu.log)')
+            time.sleep(0.5)
+
+    def _set_clock(self):
+        """True once the clock is set; False if SSH does not answer yet."""
+        p = subprocess.Popen([*self.ssh_argv()[:-1], '-o', 'ConnectTimeout=5', 'tester@127.0.0.1', self.CLOCK_PS],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            ready, _, _ = select.select([p.stdout], [], [], 20)
+            line = p.stdout.readline() if ready else ''
+            if not line.strip().isdigit():
+                p.kill()
+                p.communicate()
+                return False
+            p.stdin.write(f'{int(time.time() * 1000) - int(line)}\n')
+            p.stdin.close()
+            out = p.communicate(timeout=30)[0]
+        except BaseException:
+            p.kill()
+            p.wait()
+            raise
+        if p.returncode != 0:
+            raise RuntimeError(f'setting the guest clock: {out}')
+        return True
+
+    def _qemu_argv(self, disk, d, seed_port=None):
+        qemu = ['qemu-system-x86_64', '-name', 'win-test', '-enable-kvm',
+                '-machine', 'q35,smm=on', '-global', 'driver=cfi.pflash01,property=secure,value=on',
+                '-cpu', 'host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time',
+                '-smp', str(self.cpus), '-m', str(self.mem_mb),
+                '-drive', f'if=pflash,format=raw,readonly=on,file={self.OVMF_CODE}',
+                '-drive', f'if=pflash,format=raw,file={d}/vars.fd',
+                '-chardev', f'socket,id=chrtpm,path={_tpm_live(d)}/swtpm.sock',
+                '-tpmdev', 'emulator,id=tpm0,chardev=chrtpm', '-device', 'tpm-tis,tpmdev=tpm0',
+                '-device', 'ahci,id=ahci', '-drive', f'id=disk,file={disk},if=none,format=qcow2',
+                '-device', 'ide-hd,drive=disk,bus=ahci.0,bootindex=1',
+                '-nic', f'user,model=e1000e,hostfwd=tcp:127.0.0.1:{self.ssh_port}-:22',
+                '-device', 'qemu-xhci', '-device', 'usb-tablet',
+                '-device', 'vmgenid',            # Windows reseeds its RNG when the generation ID changes (resume)
+                '-display', 'none', '-monitor', 'none', '-qmp', f'unix:{_qmp_path(d)},server=on,wait=off']
+        for t in self.acpi_tables:
+            qemu += ['-acpitable', f'file={t}']
+        if self.vnc is not None:
+            qemu += ['-vnc', f'127.0.0.1:{self.vnc}']      # for looking at the screen when debugging
+        return qemu
+
+    def _scope_argv(self, qemu, d):
+        return ['sh', '-c', self.TPM_WRAPPER, 'throwvm-tpm', _tpm_live(d), *qemu]
+
+    def _start(self, disk, d, seed_port=None, incoming=False, ram=None):
+        # swtpm's AppArmor profile only lets it write below $HOME and /tmp: its live state sits in ~/.cache.
+        live = _tpm_live(d)
+        shutil.rmtree(live, ignore_errors=True)
+        shutil.copytree(os.path.join(d, 'tpm'), live)
+        super()._start(disk, d, seed_port, incoming, ram)
+
+    def sh(self, command, input=None, timeout=120, root=False):
+        """Run a PowerShell command in the VM as tester (an administrator; the SSH session is elevated)."""
+        if root:
+            raise ValueError('Windows: tester is already an administrator')
+        return super().sh(command, input, timeout)
+
+    def offline(self):
+        raise NotImplementedError('offline() is Ubuntu-only')
+
+    def stop(self, failed=False, remove=False):
+        self._stop_unit()
+        for f in ('disk.qcow2', 'vars.fd'):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(os.path.join(self.dir, f))
+        shutil.rmtree(os.path.join(self.dir, 'tpm'), ignore_errors=True)
+        if remove and not failed:
+            shutil.rmtree(self.dir, ignore_errors=True)
+        elif failed:
+            log(f'logs kept in {self.dir} (qemu.log, swtpm.log)')
+
+    def _stop_unit(self):
+        super()._stop_unit()
+        for d in (self.dir, *glob.glob(os.path.join(self.vm_dir, 'snapshots', f'*.tmp-{os.getpid()}'))):
+            live = _tpm_live(d)
+            with contextlib.suppress(FileNotFoundError):
+                shutil.copyfile(os.path.join(live, 'swtpm.log'), os.path.join(d, 'swtpm.log'))
+            shutil.rmtree(live, ignore_errors=True)
+
+
+def _tpm_live(d):
+    """Live swtpm state of the VM in directory d (also short enough for the socket path)."""
+    return os.path.join(os.path.expanduser('~/.cache/throwvm-tpm'), hashlib.sha256(os.path.abspath(d).encode())
+                        .hexdigest()[:16])
+
+
 def _qmp_path(d):
     """QMP socket of the VM in directory d: unix socket paths must stay under 108 bytes."""
     run = os.environ.get('XDG_RUNTIME_DIR') or '/tmp'
@@ -556,6 +749,21 @@ def main(argv=None):
                     help='stop the VM when this PID exits (bash: $$, not the $(...) subshell); 0 = keep running')
     up.add_argument('--fresh', action='store_true', help='boot through cloud-init instead of the snapshot')
     up.add_argument('--timeout', type=int, default=300)
+    win = sub.add_parser('up-windows', help='start a throwaway copy of a Windows golden image (vm/windows) in DIR')
+    win.add_argument('dir')
+    win.add_argument('--vm-dir', default=os.environ.get('VM_DIR'), required='VM_DIR' not in os.environ,
+                     help='where the snapshots go (default: $VM_DIR)')
+    win.add_argument('--golden', required=True, help='directory with disk.qcow2, vars.fd and tpm/ (build.sh)')
+    win.add_argument('--key', required=True, help='SSH private key that the image accepts')
+    win.add_argument('--name', default='windows')
+    win.add_argument('--mem', type=int, default=6144, help='MiB')
+    win.add_argument('--cpus', type=int, default=4)
+    win.add_argument('--ssh-port', type=int, help='fixed host port for SSH (default: a free one)')
+    win.add_argument('--vnc', type=int, help='VNC display on 127.0.0.1')
+    win.add_argument('--acpi-table', action='append', default=[], help='extra ACPI table file (e.g. MSDM)')
+    win.add_argument('--owner', type=int, required=True, help='as for up')
+    win.add_argument('--fresh', action='store_true', help='cold-boot the golden image instead of the snapshot')
+    win.add_argument('--timeout', type=int, default=600)
     down = sub.add_parser('down', help='stop the VM in DIR and delete its disk')
     down.add_argument('dir')
     down.add_argument('--failed', action='store_true', help='save the guest journal and keep the logs')
@@ -573,8 +781,12 @@ def main(argv=None):
 
     if a.cmd == '_guard':
         return guard(a.owner, a.qemu[1:] if a.qemu[:1] == ['--'] else a.qemu)
-    if a.cmd == 'up':
-        vm = VM(a.dir, a.vm_dir, a.name, a.mem, a.cpus, a.disk_gb, a.hostname, owner=a.owner, fresh=a.fresh)
+    if a.cmd in ('up', 'up-windows'):
+        if a.cmd == 'up':
+            vm = VM(a.dir, a.vm_dir, a.name, a.mem, a.cpus, a.disk_gb, a.hostname, owner=a.owner, fresh=a.fresh)
+        else:
+            vm = WindowsVM(a.dir, a.vm_dir, a.golden, os.path.abspath(a.key), a.name, a.mem, a.cpus, a.ssh_port, a.vnc,
+                           [os.path.abspath(t) for t in a.acpi_table], owner=a.owner, fresh=a.fresh)
         vm.boot(a.timeout)
         print(f'VM_SSH=({shlex.join(vm.ssh_argv())})\nVM_SSH_PORT={vm.ssh_port}\nVM_KEY={shlex.quote(vm.key)}\n'
               f'VM_UNIT={vm.unit}')

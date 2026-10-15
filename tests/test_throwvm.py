@@ -46,5 +46,42 @@ class Guard(unittest.TestCase):
         self.assertEqual(self.guard(0, ["sh", "-c", "exit 3"]).wait(15), 3)
 
 
+class WindowsMachine(unittest.TestCase):
+    def vm(self, d):
+        return throwvm.WindowsVM(d, "/vms", "/golden", "/key", ssh_port=2224, vnc=24, acpi_tables=["/w/MSDM.bin"])
+
+    def test_resume_maps_the_snapshot_ram_copy_on_write_and_keeps_it_unwritten(self):
+        vm = self.vm("/data/run")
+        vm.ssh_port = 2224
+        argv = vm._qemu_argv("/data/run/disk.qcow2", "/data/run")
+        self.assertIn("tcp:127.0.0.1:2224-:22", " ".join(argv))
+        self.assertIn("file=/w/MSDM.bin", argv)
+        self.assertIn("127.0.0.1:24", argv)
+        # swtpm is started by the scope's wrapper, which then becomes QEMU
+        wrapped = vm._scope_argv(argv, "/data/run")
+        self.assertEqual(wrapped[:2], ["sh", "-c"])
+        self.assertEqual(wrapped[-len(argv):], argv)
+
+    def test_tpm_socket_path_fits_a_unix_socket(self):
+        live = throwvm._tpm_live("/a/very/long/" + "x" * 200)
+        self.assertLess(len(live + "/swtpm.sock"), 108)
+        self.assertNotEqual(live, throwvm._tpm_live("/other"))
+
+    def test_load_returns_the_windows_class(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            vm = self.vm(d)
+            vm.ssh_port, vm.unit = 2224, "u.scope"
+            vm._save()
+            loaded = throwvm.VM.load(d)
+            self.assertIsInstance(loaded, throwvm.WindowsVM)
+            self.assertEqual((loaded.golden, loaded.key, loaded.unit), ("/golden", "/key", "u.scope"))
+            # vm.json from before the kind field still loads as Ubuntu
+            j = json.load(open(f"{d}/vm.json"))
+            del j["kind"], j["golden"]
+            json.dump(j, open(f"{d}/vm.json", "w"))
+            self.assertIs(type(throwvm.VM.load(d)), throwvm.VM)
+
+
 if __name__ == "__main__":
     unittest.main()
