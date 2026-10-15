@@ -136,8 +136,9 @@ On an Apple Silicon Mac you reach as `ssh HOST` (key login), throwvm runs VMs th
 the Mac (`-J HOST`). No snapshots or cgroups: each VM is an APFS clone, so it starts in seconds and costs no disk
 until written. `--owner` works as on Linux.
 
-- `up-mac DIR --host imac --base BASE`: a [Tart](https://tart.run) VM (macOS or Linux) cloned from the local Tart
-  VM `BASE`; the key goes in through Tart's guest agent (`tart exec`), so no password. Needs Tart on the Mac's PATH.
+- `up-mac DIR --host imac --base BASE`: a macOS or Ubuntu (arm64) VM, cloned from the local
+  [Tart](https://tart.run) VM `BASE` (e.g. `tart clone ghcr.io/cirruslabs/ubuntu:latest ubuntu-base`). The key
+  goes in through Tart's guest agent (`tart exec`), so no password. Needs Tart on the Mac's PATH.
 - `up-mac-windows DIR --host imac --golden DIR_ON_MAC --key KEY`: a copy of a Windows on Arm golden image
   (`disk.raw`, `vars.fd`, `code.fd` = Ubuntu's AAVMF firmware) run by the QEMU in UTM.app with Apple's hypervisor.
   UTM's own launcher only runs inside the app, so throwvm compiles a small `~/bin/qemu-launch` on the Mac and signs
